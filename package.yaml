@@ -39,6 +39,7 @@ executables:
     - pandoc-types
     - shake
     - text
+    - split
 
 tests:
   mktangle-test:

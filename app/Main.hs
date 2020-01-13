@@ -34,21 +34,27 @@ data Rewrite = Rewrite
   , rewriteProvides :: [String]
   , rewriteInclude :: Bool
   , rewriteFilename :: String
+  , rewriteVegaLite :: Bool
   }
 defaultRewrite = Rewrite{rewriteExec=False, rewriteNeeds=[], rewriteProvides=[],
-                         rewriteInclude=False, rewriteFilename=""}
+                         rewriteInclude=False, rewriteFilename="", rewriteVegaLite=False}
 
+{- HLINT ignore "Use tuple-section" -}
 attrsToRewrite :: Attr -> (Rewrite, Attr)
 attrsToRewrite attrs@(ident, classes, kvs) =
-  let (rewrite, newkvs) = foldl foldFn (defaultRewrite, []) kvs
-        where foldFn (z, newkvs) elem@(k,v)
-                | k == "exec" = (z{rewriteExec=True}, newkvs)
-                | k == "needs" = (z{rewriteNeeds=splitOn "," v}, newkvs)
-                | k == "provides" = (z{rewriteProvides=splitOn "," v}, newkvs)
-                | k == "include" = (z{rewriteInclude=True}, newkvs)
-                | k == "filename" = (z{rewriteFilename=v}, newkvs)
-                | otherwise = (z, elem:newkvs)
-          in (rewrite, (ident, classes, newkvs))
+  let (rewrite', newkvs) = foldl kvFold (defaultRewrite, []) kvs
+      (rewrite, newcls) = foldl classFold (rewrite', []) classes
+      kvFold (z, newkvs) elem@(k,v)
+        | k == "needs" = (z{rewriteNeeds=splitOn "," v}, newkvs)
+        | k == "provides" = (z{rewriteProvides=splitOn "," v}, newkvs)
+        | k == "filename" = (z{rewriteFilename=v}, newkvs)
+        | otherwise = (z, elem:newkvs)
+      classFold (z, newcls) elem
+        | elem == "exec" = (z{rewriteExec=True}, newcls)
+        | elem == "vegalite" = (z{rewriteVegaLite=True}, elem:newcls)
+        | elem == "include" = (z{rewriteInclude=True}, newcls)
+        | otherwise = (z, elem:newcls)
+      in (rewrite, (ident, newcls, newkvs))
 
 pandocOptions = def{readerExtensions=pandocExtensions}
 
@@ -58,8 +64,10 @@ textToBlocks text = do
   let (Pandoc _ newblocks) = newpandoc
   return newblocks
 
-processAST :: Block -> Action Block
-processAST div@(Div attrs blocks) =
+{- HLINT ignore "Used otherwise as a pattern" -}
+{- HLINT ignore "Redundant do" -}
+processAST :: (String -> Action Template) -> Block -> Action Block
+processAST getTemplate div@(Div attrs blocks) =
   case attrsToRewrite attrs of
     (Rewrite{rewriteInclude=True, rewriteFilename=filename}, newattrs) -> do
       newcontents <- readFile' filename
@@ -68,16 +76,24 @@ processAST div@(Div attrs blocks) =
     (Rewrite{rewriteExec=True, rewriteNeeds=deps, rewriteProvides=outs}, newattrs) -> do
       return $ Div newattrs blocks
     otherwise -> return div
-processAST code@(CodeBlock attrs contents) = unsafePerformIO $ do
-  print code
-  return $ case attrsToRewrite attrs of
-      (Rewrite{rewriteInclude=True, rewriteFilename=filename}, newattrs) -> do
-        newcontents <- readFile' filename
-        processAST $ CodeBlock newattrs newcontents
-      (Rewrite{rewriteExec=True, rewriteNeeds=deps, rewriteProvides=outs}, newattrs) -> do
-        processAST $ CodeBlock newattrs contents
-      otherwise -> return code
-processAST block = return block
+processAST getTemplate code@(CodeBlock attrs contents) = 
+  let (rewrites, newattrs) = attrsToRewrite attrs
+   in doCodeRewrites getTemplate rewrites $ CodeBlock newattrs contents
+processAST getTemplate block = return block
+
+doCodeRewrites getTemplate rewrites code@(CodeBlock attrs contents) =
+  case rewrites of
+    Rewrite{rewriteInclude=True, rewriteFilename=filename} -> do
+      newcontents <- readFile' filename
+      doCodeRewrites getTemplate rewrites{rewriteInclude=False} $ CodeBlock attrs newcontents
+    Rewrite{rewriteExec=True, rewriteNeeds=deps, rewriteProvides=outs} -> do
+      doCodeRewrites getTemplate rewrites{rewriteExec=False} $ CodeBlock attrs contents
+    Rewrite{rewriteVegaLite=True} -> do
+      vegaTemplate <- getTemplate "vegalite"
+      let figId = (\(x, _, _) -> x) attrs
+      let vegahtml = renderTemplate vegaTemplate $ varListToJSON [("id", figId), ("spec", contents)]
+      processAST getTemplate $ Div attrs [Plain [RawInline (Format "html") vegahtml]]
+    otherwise -> return code
 
 isNote :: Inline -> Bool
 isNote (Note _) = True
@@ -89,15 +105,15 @@ noteToDiv (Note blocks) = Div ("", ["sidenote"], []) blocks
 footnotesToSidenotes :: [Block] -> [Block]
 footnotesToSidenotes ((Para blocks):xs) =
   let (notes, parablocks) = partition isNote blocks
-   in [Para parablocks]++(map noteToDiv notes)++(footnotesToSidenotes xs)
-footnotesToSidenotes (x:xs) = x : (footnotesToSidenotes xs)
+   in [Para parablocks] ++ map noteToDiv notes ++ footnotesToSidenotes xs
+footnotesToSidenotes (x:xs) = x : footnotesToSidenotes xs
 footnotesToSidenotes [] = []
 
-processMarkdownFile :: String -> String -> Action Text.Text
-processMarkdownFile mdfile htmlfile = do
+processMarkdownFile :: (String -> Action Template) -> String -> String -> Action Text.Text
+processMarkdownFile getTemplate mdfile htmlfile = do
   contents <- readFile' mdfile
   ast <- liftIO $ runIOorExplode $ readMarkdown pandocOptions $ Text.pack contents
-  expanded <- walkM processAST $ walk footnotesToSidenotes ast
+  expanded <- walkM (processAST getTemplate) $ walk footnotesToSidenotes ast
   liftIO $ runIOorExplode $ writeHtml5String def expanded
 
 data Options = Options
@@ -105,6 +121,7 @@ data Options = Options
   , optSiteDir :: Maybe String
   , optBuildDir :: Maybe String
   , optTemplateDir :: Maybe String
+  , optAssetDir :: Maybe String
   }
 
 defaultOptions = Options
@@ -112,6 +129,7 @@ defaultOptions = Options
   , optSiteDir = Just "_site"
   , optBuildDir = Just "_build"
   , optTemplateDir = Just "templates"
+  , optAssetDir = Just "assets"
   }
 
 options :: [OptDescr (Either String (Options -> Options))]
@@ -119,7 +137,8 @@ options =
   [ Option ['p'] ["posts"] (OptArg (\f -> Right (\opts -> opts{optPostDir=Just $ fromMaybe "posts" f})) "DIR") "Directory of markdown posts"
   , Option ['s'] ["site"] (OptArg (\f -> Right (\opts -> opts{optSiteDir=Just $ fromMaybe "_site" f})) "DIR") "Final static site"
   , Option ['b'] ["build"] (OptArg (\f -> Right (\opts -> opts{optBuildDir=Just $ fromMaybe "_build" f})) "DIR") "Directory for intermediate build outputs"
-  , Option ['t'] ["templates"] (OptArg (\f -> Right (\opts -> opts{optTemplateDir=Just $ fromMaybe "templates" f})) "DIR") "Directory for intermediate build outputs"
+  , Option ['t'] ["templates"] (OptArg (\f -> Right (\opts -> opts{optTemplateDir=Just $ fromMaybe "templates" f})) "DIR") "Directory for templates"
+  , Option ['a'] ["assets"] (OptArg (\f -> Right (\opts -> opts{optAssetDir=Just $ fromMaybe "assets" f})) "DIR") "Directory for static assets"
   ]
 
 main :: IO ()
@@ -132,8 +151,14 @@ buildAllMdFilesIn dirpath = action $ do
   outdir <- getShakeOutDir
   need $ (outdir </> "index.html"):[ outdir </> filename -<.> "html" | filename <- posts ]
 
-buildRules :: String -> String -> String -> String -> Rules ()
-buildRules postDir buildDir tmplDir siteDir = do
+copyAssets :: String -> Rules ()
+copyAssets assetDir = action $ do
+  files <- getDirectoryFiles assetDir ["//*"]
+  outdir <- getShakeOutDir
+  need $ [outdir </> "assets" </> file | file <- files]
+
+buildRules :: String -> String -> String -> String -> String -> Rules ()
+buildRules postDir buildDir tmplDir assetDir siteDir = do
   phony "clean" $ do
     putInfo $ "Cleaning files in "++buildDir++" and "++siteDir
     removeFilesAfter buildDir ["//*"]
@@ -152,10 +177,13 @@ buildRules postDir buildDir tmplDir siteDir = do
     let mdfile = postDir </> makeRelative siteDir out -<.> "md"
     need [mdfile]
     putInfo $ "Building "++out++" from "++mdfile
-    htmlcontents <- processMarkdownFile mdfile out
+    htmlcontents <- processMarkdownFile getTemplate mdfile out
     template <- getTemplate "post"
     let foo = renderTemplate template $ varListToJSON [("body", Text.unpack htmlcontents)]
     writeFile' out foo
+
+  siteDir </> "assets" <//> "*" %> \out -> do
+    copyFile' (assetDir </> makeRelative (siteDir </> "assets") out) out
 
 build :: IO ()
 build = do
@@ -167,12 +195,13 @@ build = do
         siteDir = fromJust $ optSiteDir flags
         buildDir = fromJust $ optBuildDir flags
         templateDir = fromJust $ optTemplateDir flags
+        assetDir = fromJust $ optAssetDir flags
         newShakeOpts = skopts{
             shakeFiles = buildDir,
             shakeExtra = addShakeExtra (ShakeInDir postDir) $
                          addShakeExtra (ShakeOutDir siteDir) (shakeExtra skopts),
             shakeVersion = versionHash } in
           return $ Just (newShakeOpts, do
-            let rules = buildAllMdFilesIn postDir >> buildRules postDir buildDir templateDir siteDir
+            let rules = buildAllMdFilesIn postDir >> copyAssets assetDir >> buildRules postDir buildDir templateDir assetDir siteDir
             if null targets then rules else want targets >> withoutActions rules)
 

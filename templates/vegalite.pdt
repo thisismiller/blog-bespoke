@@ -1,0 +1,13 @@
+<script type="text/javascript">
+  let vegaliteSpec$id$ = $spec$;
+	vegaliteSpec$id$.config = {
+		"axis": {
+			"labelFont": "Open Sans",
+			"labelFontSize": 14,
+			"titleFont": "Open Sans",
+			"titleFontSize": 16,
+      "titleFontStyle": "none"
+		}
+  };
+  vegaEmbed('#$id$', vegaliteSpec$id$, {actions: false});
+</script>

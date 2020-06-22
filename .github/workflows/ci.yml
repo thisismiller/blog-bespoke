@@ -35,3 +35,7 @@ jobs:
         cd mktangle
         stack build --system-ghc --test --bench --no-run-tests --no-run-benchmarks
 
+    - name: Generate site
+      run: |
+        cd mktangle
+        stack run mktangle-exe -- --posts=../posts --site=../_site --build=../_build --templates=../templates --assets=../assets

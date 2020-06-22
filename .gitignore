@@ -1,0 +1,5 @@
+.stack-work/
+*~
+.*.swp
+_build
+_site

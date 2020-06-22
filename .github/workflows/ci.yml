@@ -34,8 +34,17 @@ jobs:
       run: |
         cd mktangle
         stack build --system-ghc --test --bench --no-run-tests --no-run-benchmarks
+        stack run mktangle-exe -- --help
 
     - name: Generate site
       run: |
         cd mktangle
         stack run mktangle-exe -- --posts=../posts --site=../_site --build=../_build --templates=../templates --assets=../assets
+
+    - uses: JamesIves/github-pages-deploy-action@releases/v3
+      name: Push site
+      with:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        BRANCH: master
+        FOLDER: _site
+

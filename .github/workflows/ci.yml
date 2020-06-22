@@ -3,7 +3,7 @@ name: CI/CD
 on:
   pull_request:
   push:
-    branches: [master]
+    branches: [trunk]
 
 jobs:
   stack:
@@ -16,7 +16,7 @@ jobs:
 
     steps:
     - uses: actions/checkout@v2
-      if: github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.ref == 'refs/heads/master'
+      if: github.event.action == 'opened' || github.event.action == 'synchronize' || github.event.ref == 'refs/heads/trunk'
 
     - uses: actions/setup-haskell@v1.1
       name: Setup Haskell Stack

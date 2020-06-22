@@ -1,5 +1,6 @@
 import System.Environment
 import System.Console.GetOpt
+import System.Process
 import Development.Shake
 import Development.Shake.Command
 import Development.Shake.FilePath
@@ -7,13 +8,20 @@ import Development.Shake.Util
 import Text.Pandoc
 import Text.Pandoc.Definition
 import Text.Pandoc.Walk
+import Text.Pandoc.Readers.Markdown
 import qualified Data.Text as Text
 import qualified Data.Text.IO as TextIO
 import System.IO.Unsafe (unsafePerformIO)
 import Data.Maybe ( fromMaybe, fromJust )
 import Data.Either (fromRight)
-import Data.List ( partition )
+import Data.List ( partition, isPrefixOf )
 import Data.List.Split ( splitOn )
+import qualified Data.YAML as YAML
+import Control.Monad
+import qualified Data.ByteString.Lazy as BSL
+import qualified Data.ByteString.Lazy.UTF8 as BSLU
+import qualified Data.Aeson as Aeson
+import Data.Aeson ((.=))
 
 newtype ShakeOutDir = ShakeOutDir String
 newtype ShakeInDir = ShakeInDir String
@@ -30,13 +38,14 @@ getShakeInDir = do
 
 data Rewrite = Rewrite
   { rewriteExec :: Bool
+  , rewriteBuild :: Bool
   , rewriteNeeds :: [String]
   , rewriteProvides :: [String]
   , rewriteInclude :: Bool
   , rewriteFilename :: String
   , rewriteVegaLite :: Bool
   }
-defaultRewrite = Rewrite{rewriteExec=False, rewriteNeeds=[], rewriteProvides=[],
+defaultRewrite = Rewrite{rewriteExec=False, rewriteBuild=False, rewriteNeeds=[], rewriteProvides=[],
                          rewriteInclude=False, rewriteFilename="", rewriteVegaLite=False}
 
 {- HLINT ignore "Use tuple-section" -}
@@ -51,6 +60,7 @@ attrsToRewrite attrs@(ident, classes, kvs) =
         | otherwise = (z, elem:newkvs)
       classFold (z, newcls) elem
         | elem == "exec" = (z{rewriteExec=True}, newcls)
+        | elem == "build" = (z{rewriteBuild=True}, newcls)
         | elem == "vegalite" = (z{rewriteVegaLite=True}, elem:newcls)
         | elem == "include" = (z{rewriteInclude=True}, newcls)
         | otherwise = (z, elem:newcls)
@@ -66,33 +76,43 @@ textToBlocks text = do
 
 {- HLINT ignore "Used otherwise as a pattern" -}
 {- HLINT ignore "Redundant do" -}
-processAST :: (String -> Action Template) -> Block -> Action Block
-processAST getTemplate div@(Div attrs blocks) =
-  case attrsToRewrite attrs of
-    (Rewrite{rewriteInclude=True, rewriteFilename=filename}, newattrs) -> do
-      newcontents <- readFile' filename
-      newblocks <- liftIO $ textToBlocks $ Text.pack newcontents
-      return $ Div newattrs newblocks
-    (Rewrite{rewriteExec=True, rewriteNeeds=deps, rewriteProvides=outs}, newattrs) -> do
-      return $ Div newattrs blocks
-    otherwise -> return div
-processAST getTemplate code@(CodeBlock attrs contents) = 
+processAST :: (String -> Action Template) -> String -> Block -> Action Block
+processAST getTemplate cwd div@(Div attrs blocks) =
   let (rewrites, newattrs) = attrsToRewrite attrs
-   in doCodeRewrites getTemplate rewrites $ CodeBlock newattrs contents
-processAST getTemplate block = return block
+   in doDivRewrites getTemplate cwd rewrites $ Div newattrs blocks
+processAST getTemplate cwd code@(CodeBlock attrs contents) =
+  let (rewrites, newattrs) = attrsToRewrite attrs
+   in doCodeRewrites getTemplate cwd rewrites $ CodeBlock newattrs contents
+processAST getTemplate cwd block = return block
 
-doCodeRewrites getTemplate rewrites code@(CodeBlock attrs contents) =
+doDivRewrites getTemplate cwd rewrites div@(Div attrs blocks) =
   case rewrites of
     Rewrite{rewriteInclude=True, rewriteFilename=filename} -> do
-      newcontents <- readFile' filename
-      doCodeRewrites getTemplate rewrites{rewriteInclude=False} $ CodeBlock attrs newcontents
+      let includePath = cwd </> filename
+      rawcontents <- readFile' includePath
+      (Pandoc _ newblocks) <- processMarkdownString getTemplate (dropFileName includePath) rawcontents
+      doDivRewrites getTemplate cwd rewrites{rewriteInclude=False} $ Div attrs newblocks
     Rewrite{rewriteExec=True, rewriteNeeds=deps, rewriteProvides=outs} -> do
-      doCodeRewrites getTemplate rewrites{rewriteExec=False} $ CodeBlock attrs contents
+      doDivRewrites getTemplate cwd rewrites{rewriteExec=False} $ Div attrs blocks
+    otherwise -> return div
+
+doCodeRewrites getTemplate cwd rewrites code@(CodeBlock attrs contents) =
+  case rewrites of
+    Rewrite{rewriteInclude=True, rewriteFilename=filename} -> do
+      let includePath = cwd </> filename
+      newcontents <- readFile' includePath
+      doCodeRewrites getTemplate (dropFileName includePath) rewrites{rewriteInclude=False} $ CodeBlock attrs newcontents
+    Rewrite{rewriteBuild=True} -> do
+      newcontents <- liftIO $ readCreateProcess (shell contents){cwd=Just cwd} ""
+      return Null
+    Rewrite{rewriteExec=True, rewriteNeeds=deps, rewriteProvides=outs} -> do
+      newcontents <- liftIO $ readCreateProcess (shell contents){cwd=Just cwd} ""
+      doCodeRewrites getTemplate cwd rewrites{rewriteExec=False} $ CodeBlock attrs newcontents
     Rewrite{rewriteVegaLite=True} -> do
       vegaTemplate <- getTemplate "vegalite"
       let figId = (\(x, _, _) -> x) attrs
       let vegahtml = renderTemplate vegaTemplate $ varListToJSON [("id", figId), ("spec", contents)]
-      processAST getTemplate $ Div attrs [Plain [RawInline (Format "html") vegahtml]]
+      return $ Div attrs [Plain [RawInline (Format "html") vegahtml]]
     otherwise -> return code
 
 isNote :: Inline -> Bool
@@ -109,11 +129,15 @@ footnotesToSidenotes ((Para blocks):xs) =
 footnotesToSidenotes (x:xs) = x : footnotesToSidenotes xs
 footnotesToSidenotes [] = []
 
+processMarkdownString :: (String -> Action Template) -> String -> String -> Action Pandoc
+processMarkdownString getTemplate cwd contents = do
+  ast <- liftIO $ runIOorExplode $ readMarkdown pandocOptions $ Text.pack contents
+  walkM (processAST getTemplate cwd) $ walk footnotesToSidenotes ast
+
 processMarkdownFile :: (String -> Action Template) -> String -> String -> Action Text.Text
 processMarkdownFile getTemplate mdfile htmlfile = do
   contents <- readFile' mdfile
-  ast <- liftIO $ runIOorExplode $ readMarkdown pandocOptions $ Text.pack contents
-  expanded <- walkM (processAST getTemplate) $ walk footnotesToSidenotes ast
+  expanded <- processMarkdownString getTemplate (dropFileName mdfile) contents
   liftIO $ runIOorExplode $ writeHtml5String def expanded
 
 data Options = Options
@@ -145,20 +169,61 @@ main :: IO ()
 main = do
   build
 
-buildAllMdFilesIn :: String -> Rules ()
-buildAllMdFilesIn dirpath = action $ do
+isPostNotKeyword :: String -> (FilePath -> Action Meta) -> String -> Action Bool
+isPostNotKeyword keyword getMetadata path = do
+  meta <- getMetadata path
+  let metavalue = fromMaybe (MetaBool False) $ lookupMeta keyword meta
+  let ret = metavalue == (MetaBool True)
+  return $ not ret
+
+isPostNotIgnored = isPostNotKeyword "ignore"
+isPostNotHidden = isPostNotKeyword "hidden"
+
+getTitle :: (FilePath -> Action Meta) -> String -> Action String
+getTitle getMetadata path = do
+  meta <- getMetadata path
+  let MetaInlines title = fromMaybe (MetaInlines [Str path]) $ lookupMeta "title" meta
+  rendered <- liftIO $ runIOorExplode $ writeHtml5String def (Pandoc nullMeta [Plain title])
+  return $ Text.unpack rendered
+getSummary :: (FilePath -> Action Meta) -> String -> Action String
+getSummary getMetadata path = do
+  meta <- getMetadata path
+  let MetaInlines summary = fromMaybe (MetaInlines [Str "ibid."]) $ lookupMeta "summary" meta
+  rendered <- liftIO $ runIOorExplode $ writeHtml5String def (Pandoc nullMeta [Plain summary])
+  return $ Text.unpack rendered
+
+getMetaObject :: (FilePath -> Action Meta) -> String -> Action Aeson.Value
+getMetaObject getMetadata path = do
+  title <- getTitle getMetadata path
+  summary <- getSummary getMetadata path
+  let link = path -<.> "html"
+  return $ Aeson.object [ (Text.pack "title") .= title,
+                          (Text.pack "summary") .= summary,
+                          (Text.pack "link") .= link ]
+
+metadataCache :: String -> Rules (FilePath -> Action Meta)
+metadataCache postDir = newCache $ \mdpath -> do
+  contents <- readFile' $ postDir </> mdpath
+  let header' = take 1 $ drop 1 $ splitOn "---" contents
+  let header = if null header' then "   " else header' !! 0
+  meta <- liftIO $ runIOorExplode $ yamlToMeta pandocOptions $ BSLU.fromString header
+  return meta
+
+buildAllMdFilesIn :: (FilePath -> Action Meta) -> String -> Rules ()
+buildAllMdFilesIn getMetadata dirpath = action $ do
   posts <- getDirectoryFiles dirpath ["//*.md"]
+  postsToBuild <- filterM (isPostNotIgnored getMetadata) posts
   outdir <- getShakeOutDir
-  need $ (outdir </> "index.html"):[ outdir </> filename -<.> "html" | filename <- posts ]
+  need $ (outdir </> "index.html"):[ outdir </> filename -<.> "html" | filename <- postsToBuild ]
 
 copyAssets :: String -> Rules ()
 copyAssets assetDir = action $ do
   files <- getDirectoryFiles assetDir ["//*"]
   outdir <- getShakeOutDir
-  need $ [outdir </> "assets" </> file | file <- files]
+  need $ [outdir </> "assets" </> file | file <- files, not $ "." `isPrefixOf` file]
 
-buildRules :: String -> String -> String -> String -> String -> Rules ()
-buildRules postDir buildDir tmplDir assetDir siteDir = do
+buildRules :: (FilePath -> Action Meta) -> String -> String -> String -> String -> String -> Rules ()
+buildRules getMetadata postDir buildDir tmplDir assetDir siteDir = do
   phony "clean" $ do
     putInfo $ "Cleaning files in "++buildDir++" and "++siteDir
     removeFilesAfter buildDir ["//*"]
@@ -171,7 +236,15 @@ buildRules postDir buildDir tmplDir assetDir siteDir = do
     let Right x = compileTemplate templateText in return x
 
   siteDir </> "index.html" %> \out -> do
-    writeFile' out "<html><head></head><body><a href=\"fifo_vs_lifo_queues.html\">post</a></body></html>"
+    template <- getTemplate "index"
+    mdposts <- getDirectoryFiles postDir ["//*.md"]
+    need [postDir </> post | post <- mdposts]
+    putInfo $ "Building "++siteDir </> "index.html"
+    mdpostsToBuild' <- filterM (isPostNotIgnored getMetadata) $ mdposts
+    mdpostsToBuild <- filterM (isPostNotHidden getMetadata) $ mdpostsToBuild'
+    postdata <- mapM (getMetaObject getMetadata) mdpostsToBuild
+    let foo = renderTemplate template $ Aeson.object [ (Text.pack "posts") .= postdata ]
+    writeFile' out foo
 
   siteDir <//> "*.html" %> \out -> do
     let mdfile = postDir </> makeRelative siteDir out -<.> "md"
@@ -183,7 +256,10 @@ buildRules postDir buildDir tmplDir assetDir siteDir = do
     writeFile' out foo
 
   siteDir </> "assets" <//> "*" %> \out -> do
-    copyFile' (assetDir </> makeRelative (siteDir </> "assets") out) out
+    let assetfile = assetDir </> makeRelative (siteDir </> "assets") out
+    need [assetfile]
+    putInfo $ "Building "++out++" from "++assetfile
+    copyFile' assetfile out
 
 build :: IO ()
 build = do
@@ -202,6 +278,7 @@ build = do
                          addShakeExtra (ShakeOutDir siteDir) (shakeExtra skopts),
             shakeVersion = versionHash } in
           return $ Just (newShakeOpts, do
-            let rules = buildAllMdFilesIn postDir >> copyAssets assetDir >> buildRules postDir buildDir templateDir assetDir siteDir
+            getMetadata <- metadataCache postDir
+            let rules = buildAllMdFilesIn getMetadata postDir >> copyAssets assetDir >> buildRules getMetadata postDir buildDir templateDir assetDir siteDir
             if null targets then rules else want targets >> withoutActions rules)
 

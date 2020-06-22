@@ -40,6 +40,11 @@ executables:
     - shake
     - text
     - split
+    - process
+    - aeson
+    - bytestring
+    - utf8-string
+    - HsYAML
 
 tests:
   mktangle-test:

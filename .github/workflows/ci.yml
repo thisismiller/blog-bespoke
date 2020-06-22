@@ -25,9 +25,9 @@ jobs:
         stack-version: ${{ matrix.stack }}
 
     - uses: actions/cache@v1
-      name: Cache ~/mktangle/.stack
+      name: Cache ~/.stack
       with:
-        path: ~/mktangle/.stack
+        path: ~/.stack
         key: ${{ runner.os }}-${{ matrix.ghc }}-stack
 
     - name: Build
